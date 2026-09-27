@@ -1,0 +1,22 @@
+# Build output and fetched dependencies
+build/
+out/
+deps/
+.vs/
+CMakeUserPresets.json
+*.user
+
+# Binaries
+*.dll
+*.addon
+*.addon64
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.log
+
+# Release archive
+*.zip
+
