@@ -936,6 +936,30 @@ static void on_present(command_queue *queue, swapchain *, const rect *, const re
     bind(srv.handle != 0 ? want : 0, srv);
 }
 
+// For another add-on in the same process, such as HDR Bridge, which reads the
+// HUD at present before this add-on's own callback may have run. Returns 1 and
+// a view of this frame's HUD texture when the game draws its HUD into one; 2
+// when it draws onto the back buffer, where the mask is only built after
+// present and so cannot be offered here; 0 when there is no HUD or the add-on
+// is off. dev is the reshade::api::device the two share. The view belongs to
+// this add-on and is good for the current frame only.
+extern "C" __declspec(dllexport) int hudmask_frame_texture(void *dev, uint64_t *srv)
+{
+    *srv = 0;
+    if (!g_enabled || dev == nullptr)
+        return 0;
+    if (g_clean_copied || (g_bound != 0 && g_bound == g_fm.mask.handle))
+        return 2;
+    // Drawn this frame and not yet taken by on_present, or already bound by it.
+    uint64_t hud = g_frame_hud.load();
+    if (hud == 0)
+        hud = g_bound;
+    if (hud == 0)
+        return 0;
+    *srv = view_of(static_cast<device *>(dev), resource{hud}).handle;
+    return *srv != 0 ? 1 : 0;
+}
+
 static void on_init_effect_runtime(effect_runtime *runtime)
 {
     g_runtime = runtime;
