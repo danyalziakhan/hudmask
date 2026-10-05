@@ -45,16 +45,18 @@ float HudCover(float2 uv)
 uses it in two places: eye adaptation substitutes last frame's level under the
 HUD, and the final pass restores the original pixels where the HUD is.
 
-Another add-on in the same process can ask for the HUD directly, which is how
-[HDR Bridge](https://github.com/danyalziakhan/hdrbridge) protects it. Find the
-export with `GetProcAddress` and call it once a frame, at `present` or later:
+From 0.3, another add-on in the same process can ask for the HUD directly,
+which is how [HDR Bridge](https://github.com/danyalziakhan/hdrbridge) protects
+it. Find the export with `GetProcAddress` and call it once a frame, at
+`present` or later:
 
 ```
 int hudmask_frame_texture(void *device, uint64_t *srv);
 ```
 
-It returns 1 with a shader resource view of this frame's HUD texture, whichever
-add-on's `present` callback runs first; 2 when the HUD is drawn onto the back
+It returns 1 with a shader resource view of this frame's HUD texture, or the
+one held over a frame the game skipped, whichever add-on's `present` callback
+runs first; 2 when the HUD is drawn onto the back
 buffer, whose mask is only built after `present`; and 0 when there is no HUD or
 the add-on is off. `device` is the `reshade::api::device` both share. The view
 belongs to HUD Mask and is good for the current frame only.

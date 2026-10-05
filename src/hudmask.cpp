@@ -945,6 +945,8 @@ static void on_present(command_queue *queue, swapchain *, const rect *, const re
 // this add-on and is good for the current frame only.
 extern "C" __declspec(dllexport) int hudmask_frame_texture(void *dev, uint64_t *srv)
 {
+    if (srv == nullptr)
+        return 0;
     *srv = 0;
     if (!g_enabled || dev == nullptr)
         return 0;
