@@ -86,6 +86,7 @@ struct __declspec(uuid("5c8e2d1a-7b43-4e96-a1f0-3d2b9c64e817")) list_state
     uint64_t ps = 0;
     uint32_t hash = 0;
     bool hud = false;
+    bool rtv_hud = false;  // the bound target is a known HUD texture
     resource_view rtv = {0};
 };
 
@@ -105,6 +106,69 @@ static std::atomic<uint64_t> g_frame_hud{0};
 // whole screen.
 static std::mutex g_frame_hud_lock;
 static uint64_t g_frame_hud_area = 0;
+
+// Learning the list while playing. A game that draws its HUD into a texture of
+// its own uses that texture for nothing else, so an unlisted shader drawing
+// into it is HUD too. Only the texture path learns: a frame drawn onto by the
+// HUD holds the scene as well, so there drawing into it proves nothing.
+static std::atomic<bool> g_learn{false};
+static std::mutex g_learn_lock;
+static uint64_t g_hud_textures[4] = {};   // trusted HUD textures; Odyssey alternates two
+static uint64_t g_hud_candidate = 0;      // a texture on probation, and for how many frames
+static uint32_t g_hud_candidate_frames = 0;
+static const uint32_t TRUST_FRAMES = 120; // about two seconds as the frame's HUD texture
+static std::unordered_map<uint32_t, uint32_t> g_learn_seen;  // hash -> frames seen drawing into it
+static const uint32_t LEARN_FRAMES = 3;
+static std::unordered_set<uint32_t> g_learn_frame;           // hashes seen this frame
+static std::vector<uint32_t> g_learned;     // added this session, for the panel
+
+static bool is_hud_texture(uint64_t handle)
+{
+    std::lock_guard lock(g_learn_lock);
+    for (uint64_t h : g_hud_textures)
+        if (h != 0 && h == handle)
+            return true;
+    return false;
+}
+
+// A HUD texture holds a picture to lay over the frame: 8 bits per channel with
+// alpha. A float target is the scene or a lighting buffer, which a listed
+// shader can also draw into on screens like the title, and trusting one would
+// teach the list every shader in the scene.
+static bool looks_like_hud(const resource_desc &d)
+{
+    switch (format_to_typeless(d.texture.format))
+    {
+    case format::r8g8b8a8_typeless:
+    case format::b8g8r8a8_typeless:
+    case format::r10g10b10a2_typeless:
+        return d.texture.samples == 1;
+    default:
+        return false;
+    }
+}
+
+// Called once a frame with the frame's HUD texture. It is trusted only after it
+// has been that for TRUST_FRAMES frames in a row and looks like a HUD texture.
+static void note_hud_texture(device *dev, uint64_t handle)
+{
+    if (handle == 0 || !looks_like_hud(dev->get_resource_desc(resource{handle})))
+        return;
+    std::lock_guard lock(g_learn_lock);
+    for (uint64_t h : g_hud_textures)
+        if (h == handle)
+            return;
+    if (handle != g_hud_candidate)
+    {
+        g_hud_candidate = handle;
+        g_hud_candidate_frames = 0;
+    }
+    if (++g_hud_candidate_frames < TRUST_FRAMES)
+        return;
+    std::move_backward(std::begin(g_hud_textures), std::end(g_hud_textures) - 1, std::end(g_hud_textures));
+    g_hud_textures[0] = handle;
+    g_hud_candidate = 0;
+}
 
 // SRVs for HUD textures. Odyssey ping-pongs between two. Each view holds a
 // reference, so keep only a handful.
@@ -310,6 +374,10 @@ static void load_settings()
     reshade::get_config_value(nullptr, SECTION, "Enabled", enabled);
     g_enabled = enabled;
     reshade::get_config_value(nullptr, SECTION, "Debug", g_debug);
+    // Learning only runs in debug mode, where the list is being built.
+    bool learn = false;
+    reshade::get_config_value(nullptr, SECTION, "LearnHud", learn);
+    g_learn = learn && g_debug;
 
     wchar_t path[MAX_PATH] = L"";
     GetModuleFileNameW(g_module, path, MAX_PATH);
@@ -368,7 +436,11 @@ static void on_bind_pipeline(command_list *cmd, pipeline_stage stages, pipeline 
 
 static void on_bind_render_targets(command_list *cmd, uint32_t count, const resource_view *rtvs, resource_view)
 {
-    state_of(cmd)->rtv = count != 0 ? rtvs[0] : resource_view{0};
+    list_state *const st = state_of(cmd);
+    st->rtv = count != 0 ? rtvs[0] : resource_view{0};
+    // Worked out here rather than per draw: binds are far fewer than draws.
+    st->rtv_hud = g_learn && g_enabled && st->rtv.handle != 0 &&
+                  is_hud_texture(cmd->get_device()->get_resource_from_view(st->rtv).handle);
 }
 
 // Deferred contexts and D3D12 lists lose their bindings on reset.
@@ -408,6 +480,12 @@ static bool on_any_draw(command_list *cmd)
     const list_state *const st = cmd->get_private_data<list_state>();
     if (st == nullptr || g_runtime == nullptr)
         return false;
+
+    if (st->rtv_hud && !st->hud && st->hash != 0)
+    {
+        std::lock_guard lock(g_learn_lock);
+        g_learn_frame.insert(st->hash);
+    }
 
     const bool scanning = g_scan_frames > 0;
     const bool logging = g_log_state == 2;
@@ -876,6 +954,35 @@ static void on_present(command_queue *queue, swapchain *, const rect *, const re
 
     finder_end_of_frame();
     log_end_of_frame(dev);
+
+    // A shader is learned once it has drawn into a trusted HUD texture in
+    // LEARN_FRAMES separate frames, so one stray draw is not enough.
+    std::vector<uint32_t> learned;
+    {
+        std::lock_guard lock(g_learn_lock);
+        for (uint32_t h : g_learn_frame)
+            if (++g_learn_seen[h] == LEARN_FRAMES)
+                learned.push_back(h);
+        g_learn_frame.clear();
+    }
+    if (!learned.empty())
+    {
+        bool added = false;
+        {
+            std::unique_lock lock(g_shaders_lock);
+            for (uint32_t h : learned)
+                if (g_hud_hashes.insert(h).second)
+                {
+                    g_learned.push_back(h);
+                    added = true;
+                    char line[128];
+                    snprintf(line, sizeof(line), "Learned HUD shader %u: it draws into the HUD texture.", h);
+                    reshade::log::message(reshade::log::level::info, line);
+                }
+        }
+        if (added)
+            save_hud_list();
+    }
     if (g_debug && g_runtime != nullptr && g_runtime->is_key_pressed(VK_DELETE))
         g_blink_list = !g_blink_list;
     if (g_debug && !g_found.empty() && g_runtime != nullptr)
@@ -901,6 +1008,10 @@ static void on_present(command_queue *queue, swapchain *, const rect *, const re
 
     if (hud != 0)
     {
+        // The frame's HUD texture, the largest a listed shader drew into, so a
+        // listed shader that also draws something small elsewhere is not
+        // mistaken for the HUD's target.
+        note_hud_texture(dev, hud);
         g_last_hud = hud;
         g_frames_without = 0;
     }
@@ -1112,7 +1223,6 @@ static void draw_settings(effect_runtime *)
         g_enabled = enabled;
         reshade::set_config_value(nullptr, SECTION, "Enabled", enabled);
     }
-
     size_t known;
     {
         std::shared_lock lock(g_shaders_lock);
@@ -1163,6 +1273,26 @@ static void draw_settings(effect_runtime *)
         save_hud_list();
     }
     ImGui::TextDisabled("HUD pixel shader hashes, comma separated, saved to hudmask.cfg. Press Enter to apply.");
+
+    bool learn = g_learn;
+    if (ImGui::Checkbox("Learn new HUD shaders while playing", &learn))
+    {
+        g_learn = learn;
+        reshade::set_config_value(nullptr, SECTION, "LearnHud", learn);
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("In a game that draws its HUD into a texture of its own, any shader that draws into\n"
+                          "that texture is added to hudmask.cfg as it appears: menus, maps, dialogue, popups.");
+    {
+        std::shared_lock lock(g_shaders_lock);
+        if (!g_learned.empty())
+        {
+            std::string list;
+            for (uint32_t h : g_learned)
+                list += (list.empty() ? "" : ", ") + std::to_string(h);
+            ImGui::TextWrapped("Learned this session: %s", list.c_str());
+        }
+    }
 
     draw_log();
     draw_finder();

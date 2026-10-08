@@ -134,6 +134,15 @@ single frame to the panel and `ReShade.log`:
 
 Click a suggestion to blink it, tick it to add it, or add them all.
 
+**Learn new HUD shaders while playing**, also in debug mode, does the same
+without the button. In a game that draws its HUD into a texture of its own, any
+unlisted shader that draws into that texture in three separate frames is added
+to `hudmask.cfg` as it appears, so playing through the menus, map, inventory,
+dialogue and popups fills the list. A texture is only trusted as the HUD's once
+it has held the HUD for about two seconds and is 8 bits per channel with alpha,
+so a scene buffer a HUD shader happens to draw into is never mistaken for it.
+It is off by default and saved as `LearnHud` under `[HUDMASK]`.
+
 ## Building
 
 Visual Studio 2022 and CMake. Clone the dependencies into `deps` first, from the

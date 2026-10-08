@@ -1,8 +1,8 @@
 #include <winver.h>
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION     0,3,0,0
-PRODUCTVERSION  0,3,0,0
+FILEVERSION     0,4,0,0
+PRODUCTVERSION  0,4,0,0
 FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
 FILEFLAGS       0
 FILEOS          VOS_NT_WINDOWS32
@@ -15,12 +15,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "Danyal Zia Khan"
             VALUE "FileDescription",  "HUD Mask, a ReShade add-on"
-            VALUE "FileVersion",      "0.3.0.0"
+            VALUE "FileVersion",      "0.4.0.0"
             VALUE "InternalName",     "hudmask"
             VALUE "LegalCopyright",   "Copyright (c) 2026 Danyal Zia Khan"
             VALUE "OriginalFilename", "hudmask.addon64"
             VALUE "ProductName",      "HUD Mask"
-            VALUE "ProductVersion",   "0.3"
+            VALUE "ProductVersion",   "0.4"
         END
     END
     BLOCK "VarFileInfo"
