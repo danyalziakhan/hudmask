@@ -61,8 +61,8 @@ buffer, whose mask is only built after `present`; and 0 when there is no HUD or
 the add-on is off. `device` is the `reshade::api::device` both share. The view
 belongs to HUD Mask and is good for the current frame only.
 
-`shaders\HudMaskView.fx` draws the mask in red over a darkened frame. Handy for
-checking a shader list: the HUD should be red, nothing else.
+`shaders\HudMaskView.fx` draws the mask in red over a darkened frame, full size,
+as an effect. The panel's **Mask preview** shows the same without enabling it.
 
 ## Installing
 
@@ -93,8 +93,15 @@ comments and survive when the finder rewrites the file.
 ## Settings
 
 The panel in the Add-ons tab has a single toggle, **Give effects the HUD mask**,
-plus a status line showing which path the game uses and how often the HUD was
-seen recently. If that stays at 0% in gameplay, the shader list doesn't match.
+plus a status card under it. Its badge reads **Active** in green, with the path
+the game uses and how often the HUD was seen recently, **Waiting for the HUD**
+in amber when no listed shader has drawn lately, **Not working** in red when
+there is no shader list or the graphics API can't build the mask, and **Off** in
+grey. If it stays on Waiting in gameplay, the shader list doesn't match.
+
+**Mask preview** under the card shows the mask the effects are given, shrunk
+to fit the panel: white is HUD, black is scene. It is drawn only while it is
+open.
 
 ![The HUD Mask panel in the Add-ons tab](screenshots/panel.png)
 
@@ -111,20 +118,45 @@ Debug=1
 
 With the HUD visible, hit **Scan**. It collects every pixel shader drawing to a
 screen-sized target over about a second, latest in the frame first (HUD usually
-draws last). Close the overlay and step through:
+draws last). Close the overlay and step through with these keys:
 
 - **Page Down / Page Up**: blink the next / previous shader
 - **Home**: add the blinking shader to the list, or remove it
 - **End**: stop blinking
 - **Delete**: blink everything in the list
 
-If part of the HUD blinks, add it. A HUD is usually several shaders (text,
-icons, bars, minimap). Skip anything that also blinks parts of the scene. Use
-Delete at the end to see what's still missing. Changes go straight to
-`hudmask.cfg`.
+Those are the defaults. To change one, open **Keys** in the finder, click its
+box and press the new key, with Ctrl, Shift or Alt if you like; Backspace leaves
+it unbound. They are saved under `[HUDMASK]` in `ReShade.ini`, and only work
+with the overlay closed. ReShade's own overlay key is Home unless you changed
+it; if a finder key is the same, the finder says so.
 
-**Log one frame** is the quicker route once you have one HUD shader. It dumps a
-single frame to the panel and `ReShade.log`:
+If part of the HUD blinks, add it. A HUD is usually several shaders (text,
+icons, bars, minimap). Skip anything that also blinks parts of the scene. Blink
+the whole list at the end to see what's still missing. Changes go straight to
+`hudmask.cfg`. **Copy** on a row puts that shader's hash on the clipboard.
+
+The list in the panel shows each listed shader with whether the game has created
+it, and a **Remove** button on every row. To add hashes by hand, type or paste
+them, comma separated, into the field under the list and press Enter or **Add**.
+ShaderToggler groups can be pasted in as they are.
+
+**Learn new HUD shaders while playing** fills in the rest once one HUD shader is
+listed. In a game that draws its HUD into a texture of its own, the listed
+shader shows which texture that is, and any unlisted shader that draws into it
+in three separate frames is added to `hudmask.cfg` as it appears, so playing
+through the menus, map, inventory, dialogue and popups fills the list. A texture
+is only trusted as the HUD's once it has held the HUD for about two seconds and
+is 8 bits per channel with alpha, so a scene buffer a HUD shader happens to draw
+into is never mistaken for it. A line under the checkbox says what it is doing:
+waiting for the HUD, checking the texture, watching it, or why it can't run. It
+can't in a game that draws its HUD onto the frame; use the finder there. It is
+off by default and saved as `LearnHud` under `[HUDMASK]`. Shaders it adds are
+listed under **Learned this session**: click one to make it blink, then **Keep**
+it or **Remove** it.
+
+**Log one frame** is for checking a list. It reports one frame in the panel and
+in `ReShade.log`, in a box you can select and copy from:
 
 - which path the game uses, plus the HUD texture's size and format
 - listed shaders that didn't draw, or drew somewhere unexpected
@@ -132,16 +164,6 @@ single frame to the panel and `ReShade.log`:
   back buffer after the first HUD draw). With a HUD texture, these are nearly
   always HUD.
 
-Click a suggestion to blink it, tick it to add it, or add them all.
-
-**Learn new HUD shaders while playing**, also in debug mode, does the same
-without the button. In a game that draws its HUD into a texture of its own, any
-unlisted shader that draws into that texture in three separate frames is added
-to `hudmask.cfg` as it appears, so playing through the menus, map, inventory,
-dialogue and popups fills the list. A texture is only trusted as the HUD's once
-it has held the HUD for about two seconds and is 8 bits per channel with alpha,
-so a scene buffer a HUD shader happens to draw into is never mistaken for it.
-It is off by default and saved as `LearnHud` under `[HUDMASK]`.
 
 ## Building
 

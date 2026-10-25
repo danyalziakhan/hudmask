@@ -72,6 +72,8 @@ static std::atomic<bool> g_enabled{true};
 static bool g_debug = false;
 static HMODULE g_module = nullptr;
 static std::wstring g_cfg_path;
+// Tells a missing hudmask.cfg apart from one whose list is empty.
+static std::atomic<bool> g_cfg_found{false};
 static std::string g_hud_list;
 static std::unordered_set<uint32_t> g_hud_hashes;
 
@@ -229,6 +231,46 @@ float4 ps_main(float4 pos : SV_Position) : SV_Target
 }
 )";
 
+// The panel's picture of the mask: its alpha as grey, white where the HUD
+// covers. Each preview pixel takes the most coverage in the block it stands
+// for, so text a pixel wide still shows when shrunk.
+static const uint32_t PREVIEW_WIDTH = 320;
+static const char *PREVIEW_SHADER = R"(
+Texture2D<float4> t_mask : register(t0);
+
+void vs_main(uint id : SV_VertexID, out float4 pos : SV_Position)
+{
+    float2 uv = float2(id == 1 ? 2.0 : 0.0, id == 2 ? 2.0 : 0.0);
+    pos = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+}
+
+float4 ps_main(float4 pos : SV_Position) : SV_Target
+{
+    uint w, h;
+    t_mask.GetDimensions(w, h);
+    uint n = (w + PREVIEW_WIDTH - 1) / PREVIEW_WIDTH;
+    int2 base = int2(pos.xy) * n;
+    int2 last = int2(w, h) - 1;
+    float a = 0.0;
+    for (uint y = 0; y < n; ++y)
+        for (uint x = 0; x < n; ++x)
+            a = max(a, t_mask.Load(int3(min(base + int2(x, y), last), 0)).a);
+    a = saturate(a);
+    return float4(a, a, a, 1.0);
+}
+)";
+
+struct mask_preview
+{
+    uint32_t width = 0, height = 0;
+    resource texture = {0};
+    resource_view rtv = {0}, srv = {0};
+};
+static mask_preview g_preview;
+static pipeline_layout g_preview_layout = {0};
+static pipeline g_preview_pipeline = {0};
+static bool g_preview_failed = false;
+
 // Panel stats, 120-frame window.
 static uint32_t g_window_frames = 0, g_window_texture = 0, g_window_built = 0;
 static float g_share_texture = 0.0f, g_share_built = 0.0f;
@@ -250,7 +292,9 @@ struct candidate
 };
 
 static std::mutex g_finder_lock;
+static const int SCAN_FRAMES = 60;
 static int g_scan_frames = 0;
+static bool g_scanned = false;  // a scan has finished at least once
 static std::unordered_map<uint32_t, candidate> g_scan;
 static std::unordered_map<uint32_t, uint32_t> g_scan_frame_pos;
 static std::atomic<uint32_t> g_scan_counter{0};
@@ -278,8 +322,6 @@ static std::mutex g_log_lock;
 static std::map<log_key, log_entry> g_log;
 static std::atomic<uint32_t> g_log_order{0};
 static std::vector<std::string> g_log_lines;
-struct suggestion { uint32_t hash, draws; };
-static std::vector<suggestion> g_suggest;
 
 // 2 Hz blink: draws are skipped during the off half.
 static bool blink_off()
@@ -287,25 +329,230 @@ static bool blink_off()
     return (GetTickCount64() / 250) % 2 == 0;
 }
 
+// Finder keys, stored in ReShade.ini the way ReShade stores its own shortcuts:
+// key code, then Ctrl, Shift and Alt. All zero means unbound.
+struct hotkey
+{
+    const char *setting;
+    const char *action;
+    uint32_t key[4];
+};
+enum { KEY_NEXT, KEY_PREVIOUS, KEY_TOGGLE, KEY_STOP, KEY_BLINK_LIST };
+static hotkey g_keys[] = {
+    {"KeyNext", "Blink the next shader in the scan", {VK_NEXT, 0, 0, 0}},
+    {"KeyPrevious", "Blink the previous shader in the scan", {VK_PRIOR, 0, 0, 0}},
+    {"KeyToggle", "Add the blinking shader to the list, or take it off", {VK_HOME, 0, 0, 0}},
+    {"KeyStop", "Finish stepping through the scan", {VK_END, 0, 0, 0}},
+    {"KeyBlinkList", "Blink the whole list on or off", {VK_DELETE, 0, 0, 0}},
+};
+// ReShade's [INPUT] ForceShortcutModifiers, so these behave like its own keys.
+static bool g_force_modifiers = true;
+// The finder keys only work with the overlay closed, so typing in a text field
+// or binding a key never steps through the list as well.
+static bool g_overlay_open = false;
+
+static void load_keys()
+{
+    reshade::get_config_value(nullptr, "INPUT", "ForceShortcutModifiers", g_force_modifiers);
+    for (hotkey &k : g_keys)
+    {
+        char value[64] = "";
+        size_t size = sizeof(value);
+        uint32_t key[4] = {};
+        if (reshade::get_config_value(nullptr, SECTION, k.setting, value, &size) &&
+            sscanf(value, "%u,%u,%u,%u", &key[0], &key[1], &key[2], &key[3]) == 4 && key[0] < 256)
+            std::copy(std::begin(key), std::end(key), k.key);
+    }
+}
+
+static void save_key(const hotkey &k)
+{
+    char value[64];
+    snprintf(value, sizeof(value), "%u,%u,%u,%u", k.key[0], k.key[1], k.key[2], k.key[3]);
+    reshade::set_config_value(nullptr, SECTION, k.setting, value);
+}
+
+static bool hotkey_pressed(const hotkey &k)
+{
+    if (k.key[0] == 0 || g_runtime == nullptr || !g_runtime->is_key_pressed(k.key[0]))
+        return false;
+    const bool ctrl = g_runtime->is_key_down(VK_CONTROL);
+    const bool shift = g_runtime->is_key_down(VK_SHIFT);
+    const bool alt = g_runtime->is_key_down(VK_MENU);
+    if (g_force_modifiers)
+        return ctrl == (k.key[1] != 0) && shift == (k.key[2] != 0) && alt == (k.key[3] != 0);
+    return (k.key[1] == 0 || ctrl) && (k.key[2] == 0 || shift) && (k.key[3] == 0 || alt);
+}
+
+static std::string utf8(const wchar_t *text)
+{
+    char out[64];
+    const int n = WideCharToMultiByte(CP_UTF8, 0, text, -1, out, sizeof(out), nullptr, nullptr);
+    return n > 0 ? std::string(out) : std::string();
+}
+
+// The name printed on the key. Keys that type a character show that
+// character in the current keyboard layout, so a German player sees Ö where
+// a US one sees ;.
+static std::string key_name(uint32_t vk)
+{
+    if ((vk >= '0' && vk <= '9') || (vk >= 'A' && vk <= 'Z'))
+        return std::string(1, char(vk));
+    if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9)
+        return "Numpad " + std::to_string(vk - VK_NUMPAD0);
+    if (vk >= VK_F1 && vk <= VK_F24)
+        return "F" + std::to_string(vk - VK_F1 + 1);
+    if ((vk >= VK_OEM_1 && vk <= VK_OEM_3) || (vk >= VK_OEM_4 && vk <= VK_OEM_8) || vk == VK_OEM_102)
+    {
+        const HKL layout = GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), nullptr));
+        // The top bit marks a dead key, such as an accent; the character is
+        // still the right label.
+        const UINT ch = MapVirtualKeyExW(vk, MAPVK_VK_TO_CHAR, layout) & 0xFFFF;
+        if (ch != 0)
+        {
+            const wchar_t text[2] = {wchar_t(ch), L'\0'};
+            return utf8(text);
+        }
+    }
+    switch (vk)
+    {
+    case VK_MBUTTON: return "Middle Mouse";
+    case VK_XBUTTON1: return "Mouse 4";
+    case VK_XBUTTON2: return "Mouse 5";
+    case VK_CANCEL: return "Break";
+    case VK_TAB: return "Tab";
+    case VK_CLEAR: return "Clear";
+    case VK_RETURN: return "Enter";
+    case VK_PAUSE: return "Pause";
+    case VK_CAPITAL: return "Caps Lock";
+    case VK_ESCAPE: return "Escape";
+    case VK_SPACE: return "Space";
+    case VK_PRIOR: return "Page Up";
+    case VK_NEXT: return "Page Down";
+    case VK_END: return "End";
+    case VK_HOME: return "Home";
+    case VK_LEFT: return "Left";
+    case VK_UP: return "Up";
+    case VK_RIGHT: return "Right";
+    case VK_DOWN: return "Down";
+    case VK_SELECT: return "Select";
+    case VK_PRINT: return "Print";
+    case VK_SNAPSHOT: return "Print Screen";
+    case VK_INSERT: return "Insert";
+    case VK_DELETE: return "Delete";
+    case VK_HELP: return "Help";
+    case VK_LWIN: return "Left Windows";
+    case VK_RWIN: return "Right Windows";
+    case VK_APPS: return "Menu";
+    case VK_SLEEP: return "Sleep";
+    case VK_MULTIPLY: return "Numpad *";
+    case VK_ADD: return "Numpad +";
+    case VK_SEPARATOR: return "Numpad Separator";
+    case VK_SUBTRACT: return "Numpad -";
+    case VK_DECIMAL: return "Numpad .";
+    case VK_DIVIDE: return "Numpad /";
+    case VK_NUMLOCK: return "Num Lock";
+    case VK_SCROLL: return "Scroll Lock";
+    case VK_BROWSER_BACK: return "Browser Back";
+    case VK_BROWSER_FORWARD: return "Browser Forward";
+    case VK_BROWSER_REFRESH: return "Browser Refresh";
+    case VK_BROWSER_STOP: return "Browser Stop";
+    case VK_BROWSER_SEARCH: return "Browser Search";
+    case VK_BROWSER_FAVORITES: return "Browser Favorites";
+    case VK_BROWSER_HOME: return "Browser Home";
+    case VK_VOLUME_MUTE: return "Mute";
+    case VK_VOLUME_DOWN: return "Volume Down";
+    case VK_VOLUME_UP: return "Volume Up";
+    case VK_MEDIA_NEXT_TRACK: return "Next Track";
+    case VK_MEDIA_PREV_TRACK: return "Previous Track";
+    case VK_MEDIA_STOP: return "Stop";
+    case VK_MEDIA_PLAY_PAUSE: return "Play/Pause";
+    case VK_LAUNCH_MAIL: return "Mail";
+    case VK_LAUNCH_MEDIA_SELECT: return "Media";
+    case VK_LAUNCH_APP1: return "App 1";
+    case VK_LAUNCH_APP2: return "App 2";
+    }
+    // Anything left, such as keys only some keyboards have, as Windows names it.
+    if (const UINT scan = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC); scan != 0)
+    {
+        wchar_t text[48] = L"";
+        if (GetKeyNameTextW(LONG(scan << 16), text, int(std::size(text))) > 0)
+            return utf8(text);
+    }
+    char unknown[16];
+    snprintf(unknown, sizeof(unknown), "Key %u", vk);
+    return unknown;
+}
+
+static std::string hotkey_name(const hotkey &k)
+{
+    if (k.key[0] == 0)
+        return std::string();
+    return std::string(k.key[1] ? "Ctrl + " : "") + (k.key[2] ? "Shift + " : "") + (k.key[3] ? "Alt + " : "") +
+           key_name(k.key[0]);
+}
+
+// A box that takes the next key pressed while it is active, with Ctrl, Shift
+// and Alt held as modifiers, like ReShade's own shortcut boxes. Backspace
+// clears it. Escape and Enter end the edit in ImGui, so the frame the box lets
+// go is checked as well, or those two could never be bound.
+static void key_box(hotkey &k)
+{
+    std::string name = hotkey_name(k);
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%s", name.c_str());
+    ImGui::InputTextWithHint("##key", "Click, then press a key", buf, sizeof(buf),
+                             ImGuiInputTextFlags_ReadOnly | ImGuiInputTextFlags_NoUndoRedo |
+                                 ImGuiInputTextFlags_NoHorizontalScroll);
+    if (ImGui::IsItemActive() || ImGui::IsItemDeactivated())
+    {
+        const uint32_t vk = g_runtime != nullptr ? g_runtime->last_key_pressed() : 0;
+        const bool modifier = (vk >= VK_SHIFT && vk <= VK_MENU) || (vk >= VK_LSHIFT && vk <= VK_RMENU);
+        if (vk == VK_BACK)
+        {
+            std::fill(std::begin(k.key), std::end(k.key), 0u);
+            save_key(k);
+        }
+        else if (vk != 0 && !modifier)
+        {
+            k.key[0] = vk;
+            k.key[1] = g_runtime->is_key_down(VK_CONTROL);
+            k.key[2] = g_runtime->is_key_down(VK_SHIFT);
+            k.key[3] = g_runtime->is_key_down(VK_MENU);
+            save_key(k);
+        }
+    }
+    else if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip("Click here and press a key, with Ctrl, Shift or Alt if you like.\nBackspace removes the key.");
+    }
+}
+
 //----------------------------------------------------------------------------
 
-static void parse_hud_list()
+static void parse_hashes(const char *p, std::unordered_set<uint32_t> &out)
 {
-    g_hud_hashes.clear();
-    const char *p = g_hud_list.c_str();
     while (*p)
     {
         char *end = nullptr;
-        const unsigned long v = strtoul(p, &end, 10);
+        // 64 bits wide so a number too big for a hash is dropped rather than
+        // clamped to 4294967295.
+        const unsigned long long v = strtoull(p, &end, 10);
         if (end == p)
         {
             ++p;
             continue;
         }
-        if (v != 0)
-            g_hud_hashes.insert(static_cast<uint32_t>(v));
+        if (v != 0 && v <= UINT32_MAX)
+            out.insert(static_cast<uint32_t>(v));
         p = end;
     }
+}
+
+static void parse_hud_list()
+{
+    g_hud_hashes.clear();
+    parse_hashes(g_hud_list.c_str(), g_hud_hashes);
 }
 
 static std::vector<std::string> read_cfg_lines()
@@ -365,6 +612,7 @@ static void save_hud_list()
         for (const std::string &l : lines)
             fprintf(f, "%s\n", l.c_str());
         fclose(f);
+        g_cfg_found = true;
     }
 }
 
@@ -378,11 +626,13 @@ static void load_settings()
     bool learn = false;
     reshade::get_config_value(nullptr, SECTION, "LearnHud", learn);
     g_learn = learn && g_debug;
+    load_keys();
 
     wchar_t path[MAX_PATH] = L"";
     GetModuleFileNameW(g_module, path, MAX_PATH);
     g_cfg_path = path;
     g_cfg_path = g_cfg_path.substr(0, g_cfg_path.find_last_of(L"\\/") + 1) + CFG_NAME;
+    g_cfg_found = GetFileAttributesW(g_cfg_path.c_str()) != INVALID_FILE_ATTRIBUTES;
 
     for (const std::string &l : read_cfg_lines())
         if (is_key_line(l))
@@ -553,14 +803,16 @@ static bool on_draw_indirect(command_list *cmd, indirect_command type, resource,
 
 //----------------------------------------------------------------------------
 
-static bool compile(const char *entry, const char *target, std::vector<uint8_t> &out)
+static bool compile(const char *source, const char *entry, const char *target, std::vector<uint8_t> &out)
 {
     static HMODULE compiler = LoadLibraryW(L"d3dcompiler_47.dll");
     const auto compile_fn = compiler != nullptr ? reinterpret_cast<pD3DCompile>(GetProcAddress(compiler, "D3DCompile")) : nullptr;
     if (compile_fn == nullptr)
         return false;
+    const std::string preview_width = std::to_string(PREVIEW_WIDTH);
+    const D3D_SHADER_MACRO defines[] = {{"PREVIEW_WIDTH", preview_width.c_str()}, {nullptr, nullptr}};
     ID3DBlob *code = nullptr, *errors = nullptr;
-    const HRESULT hr = compile_fn(FM_SHADER, strlen(FM_SHADER), nullptr, nullptr, nullptr, entry, target,
+    const HRESULT hr = compile_fn(source, strlen(source), nullptr, defines, nullptr, entry, target,
                                   D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors);
     if (errors != nullptr)
     {
@@ -575,14 +827,17 @@ static bool compile(const char *entry, const char *target, std::vector<uint8_t> 
     return true;
 }
 
-static bool create_pipeline(device *dev)
+// A full screen pass reading srv_count textures from t0 into one RGBA8 target.
+static bool create_pipeline(device *dev, const char *source, uint32_t srv_count, pipeline_layout &layout,
+                            pipeline &out)
 {
     std::vector<uint8_t> vs, ps;
-    if (!compile("vs_main", "vs_5_0", vs) || !compile("ps_main", "ps_5_0", ps))
+    if (!compile(source, "vs_main", "vs_5_0", vs) || !compile(source, "ps_main", "ps_5_0", ps))
         return false;
 
-    const pipeline_layout_param param = descriptor_range{0, 0, 0, 2, shader_stage::pixel, 1, descriptor_type::shader_resource_view};
-    if (!dev->create_pipeline_layout(1, &param, &g_fm_layout))
+    const pipeline_layout_param param =
+        descriptor_range{0, 0, 0, srv_count, shader_stage::pixel, 1, descriptor_type::shader_resource_view};
+    if (!dev->create_pipeline_layout(1, &param, &layout))
         return false;
 
     shader_desc vs_desc = {vs.data(), vs.size()};
@@ -601,7 +856,11 @@ static bool create_pipeline(device *dev)
         {pipeline_subobject_type::rasterizer_state, 1, &rasterizer},
         {pipeline_subobject_type::depth_stencil_state, 1, &depth},
     };
-    return dev->create_pipeline(g_fm_layout, static_cast<uint32_t>(std::size(subobjects)), subobjects, &g_fm_pipeline);
+    if (dev->create_pipeline(layout, static_cast<uint32_t>(std::size(subobjects)), subobjects, &out))
+        return true;
+    dev->destroy_pipeline_layout(layout);
+    layout = {0};
+    return false;
 }
 
 static void release_frame_mask(device *dev)
@@ -626,7 +885,7 @@ static bool create_frame_mask(device *dev, const resource_desc &bb)
         g_fm_failed = true;
         return false;
     }
-    if (g_fm_pipeline.handle == 0 && !create_pipeline(dev))
+    if (g_fm_pipeline.handle == 0 && !create_pipeline(dev, FM_SHADER, 2, g_fm_layout, g_fm_pipeline))
     {
         reshade::log::message(reshade::log::level::error, "HUD Mask could not build its comparison pass");
         g_fm_failed = true;
@@ -695,11 +954,87 @@ static void on_begin_effects(effect_runtime *runtime, command_list *cmd, resourc
 
 //----------------------------------------------------------------------------
 
+static resource_view g_bound_srv = {0};
+
 static void bind(uint64_t resource_handle, resource_view srv)
 {
     if (g_runtime != nullptr)
         g_runtime->update_texture_bindings(SEMANTIC, srv, srv);
     g_bound = resource_handle;
+    g_bound_srv = resource_handle != 0 ? srv : resource_view{0};
+}
+
+static void release_preview(device *dev)
+{
+    if (g_preview.rtv.handle != 0)
+        dev->destroy_resource_view(g_preview.rtv);
+    if (g_preview.srv.handle != 0)
+        dev->destroy_resource_view(g_preview.srv);
+    if (g_preview.texture.handle != 0)
+        dev->destroy_resource(g_preview.texture);
+    g_preview = mask_preview();
+}
+
+// Called while the overlay is built. ReShade has saved the game's state for
+// the frame by then, so binding anything is safe, and the overlay is rendered
+// after these commands.
+static resource_view render_preview(effect_runtime *runtime)
+{
+    if (g_bound == 0 || g_bound_srv.handle == 0 || g_preview_failed)
+        return {0};
+    device *const dev = runtime->get_device();
+    const device_api api = dev->get_api();
+    if (api != device_api::d3d11 && api != device_api::d3d12)
+    {
+        g_preview_failed = true;
+        return {0};
+    }
+    if (g_preview_pipeline.handle == 0 &&
+        !create_pipeline(dev, PREVIEW_SHADER, 1, g_preview_layout, g_preview_pipeline))
+    {
+        reshade::log::message(reshade::log::level::error, "HUD Mask could not build its preview pass");
+        g_preview_failed = true;
+        return {0};
+    }
+
+    // Same arithmetic as the shader, so every preview pixel maps to a block.
+    const resource_desc source = dev->get_resource_desc(resource{g_bound});
+    const uint32_t n = (source.texture.width + PREVIEW_WIDTH - 1) / PREVIEW_WIDTH;
+    const uint32_t width = std::max(source.texture.width / n, 1u);
+    const uint32_t height = std::max(source.texture.height / n, 1u);
+    if (g_preview.width != width || g_preview.height != height)
+    {
+        // The overlay may still be drawing the old one on the GPU.
+        if (g_preview.texture.handle != 0)
+            runtime->get_command_queue()->wait_idle();
+        release_preview(dev);
+        const resource_desc desc(width, height, 1, 1, format::r8g8b8a8_unorm, 1, memory_heap::default_,
+                                 resource_usage::render_target | resource_usage::shader_resource);
+        const resource_view_desc view(format::r8g8b8a8_unorm);
+        if (!dev->create_resource(desc, nullptr, resource_usage::shader_resource, &g_preview.texture) ||
+            !dev->create_resource_view(g_preview.texture, resource_usage::render_target, view, &g_preview.rtv) ||
+            !dev->create_resource_view(g_preview.texture, resource_usage::shader_resource, view, &g_preview.srv))
+        {
+            release_preview(dev);
+            return {0};
+        }
+        g_preview.width = width;
+        g_preview.height = height;
+    }
+
+    command_list *const cmd = runtime->get_command_queue()->get_immediate_command_list();
+    cmd->barrier(g_preview.texture, resource_usage::shader_resource, resource_usage::render_target);
+    cmd->bind_pipeline(pipeline_stage::all_graphics, g_preview_pipeline);
+    cmd->push_descriptors(shader_stage::pixel, g_preview_layout, 0,
+                          descriptor_table_update{{}, 0, 0, 1, descriptor_type::shader_resource_view, &g_bound_srv});
+    const viewport vp = {0.0f, 0.0f, float(width), float(height), 0.0f, 1.0f};
+    cmd->bind_viewports(0, 1, &vp);
+    const rect scissor = {0, 0, int32_t(width), int32_t(height)};
+    cmd->bind_scissor_rects(0, 1, &scissor);
+    cmd->bind_render_targets_and_depth_stencil(1, &g_preview.rtv);
+    cmd->draw(3, 1, 0, 0);
+    cmd->barrier(g_preview.texture, resource_usage::render_target, resource_usage::shader_resource);
+    return g_preview.srv;
 }
 
 static resource_view view_of(device *dev, resource res)
@@ -737,6 +1072,7 @@ static void release_views(device *dev)
         dev->destroy_resource_view(v.srv);
     g_views.clear();
     release_frame_mask(dev);
+    release_preview(dev);
 }
 
 static void set_step(int step)
@@ -749,7 +1085,9 @@ static void toggle_in_list(uint32_t hash)
 {
     {
         std::unique_lock lock(g_shaders_lock);
-        if (!g_hud_hashes.erase(hash))
+        if (g_hud_hashes.erase(hash))
+            g_learned.erase(std::remove(g_learned.begin(), g_learned.end(), hash), g_learned.end());
+        else
             g_hud_hashes.insert(hash);
     }
     save_hud_list();
@@ -782,6 +1120,7 @@ static void finder_end_of_frame()
             g_found.resize(64);
         g_scan.clear();
         set_step(-1);
+        g_scanned = true;
     }
 }
 
@@ -800,8 +1139,10 @@ static const char *format_name(format f)
 {
     switch (f)
     {
+    case format::r8g8b8a8_typeless:
     case format::r8g8b8a8_unorm: return "RGBA8";
     case format::r8g8b8a8_unorm_srgb: return "RGBA8 sRGB";
+    case format::b8g8r8a8_typeless:
     case format::b8g8r8a8_unorm: return "BGRA8";
     case format::b8g8r8a8_unorm_srgb: return "BGRA8 sRGB";
     case format::r10g10b10a2_unorm: return "RGB10A2";
@@ -833,7 +1174,6 @@ static void analyse_log(device *dev)
         listed = g_hud_hashes;
     }
     g_log_lines.clear();
-    g_suggest.clear();
 
     std::map<uint64_t, uint32_t> hud_targets;
     std::unordered_set<uint32_t> seen;
@@ -884,8 +1224,8 @@ static void analyse_log(device *dev)
         if (seen.count(h) == 0)
             logf("Not drawn this frame: %u", h);
 
-    // Suggestions: unlisted shaders drawing into the HUD texture, or onto the
-    // back buffer after the first HUD draw.
+    // Unlisted shaders drawing into the HUD texture, or onto the back buffer
+    // after the first HUD draw, are most likely HUD too.
     std::map<uint32_t, uint32_t> found;
     for (const auto &[k, e] : draws)
     {
@@ -894,13 +1234,11 @@ static void analyse_log(device *dev)
         if ((main_target != 0 && k.target == main_target) || (k.on_screen && screen_draws != 0 && e.first > first_on_screen))
             found[k.hash] += e.draws;
     }
-    for (const auto &[h, n] : found)
-        g_suggest.push_back({h, n});
-    if (g_suggest.empty())
+    if (found.empty())
         logf("No other shader draws where the HUD goes. The list looks complete for this frame.");
     else
-        for (const suggestion &sg : g_suggest)
-            logf("Likely HUD as well: %u, %u draws", sg.hash, sg.draws);
+        for (const auto &[h, n] : found)
+            logf("Likely HUD as well: %u, %u draws", h, n);
 
     std::string line;
     for (uint32_t h : seen)
@@ -983,17 +1321,18 @@ static void on_present(command_queue *queue, swapchain *, const rect *, const re
         if (added)
             save_hud_list();
     }
-    if (g_debug && g_runtime != nullptr && g_runtime->is_key_pressed(VK_DELETE))
+    const bool keys_live = g_debug && !g_overlay_open;
+    if (keys_live && hotkey_pressed(g_keys[KEY_BLINK_LIST]))
         g_blink_list = !g_blink_list;
-    if (g_debug && !g_found.empty() && g_runtime != nullptr)
+    if (keys_live && !g_found.empty())
     {
-        if (g_runtime->is_key_pressed(VK_NEXT))
+        if (hotkey_pressed(g_keys[KEY_NEXT]))
             set_step(g_step + 1);
-        if (g_runtime->is_key_pressed(VK_PRIOR))
+        if (hotkey_pressed(g_keys[KEY_PREVIOUS]))
             set_step(g_step - 1);
-        if (g_runtime->is_key_pressed(VK_END))
+        if (hotkey_pressed(g_keys[KEY_STOP]))
             set_step(-1);
-        if (g_runtime->is_key_pressed(VK_HOME) && g_step >= 0)
+        if (hotkey_pressed(g_keys[KEY_TOGGLE]) && g_step >= 0)
             toggle_in_list(g_found[g_step].hash);
     }
 
@@ -1088,9 +1427,21 @@ static void on_destroy_effect_runtime(effect_runtime *runtime)
         dev->destroy_pipeline(g_fm_pipeline);
     if (g_fm_layout.handle != 0)
         dev->destroy_pipeline_layout(g_fm_layout);
+    if (g_preview_pipeline.handle != 0)
+        dev->destroy_pipeline(g_preview_pipeline);
+    if (g_preview_layout.handle != 0)
+        dev->destroy_pipeline_layout(g_preview_layout);
     g_fm_pipeline = {0};
     g_fm_layout = {0};
+    g_preview_pipeline = {0};
+    g_preview_layout = {0};
     g_runtime = nullptr;
+}
+
+static bool on_open_overlay(effect_runtime *, bool open, input_source)
+{
+    g_overlay_open = open;
+    return false;
 }
 
 static void on_destroy_swapchain(swapchain *sc, bool)
@@ -1100,18 +1451,64 @@ static void on_destroy_swapchain(swapchain *sc, bool)
 
 //----------------------------------------------------------------------------
 
+// Width for a table column holding one small button, with room to its right
+// so the button does not sit against the table's scrollbar.
+static float button_column_width(const char *widest_label)
+{
+    return ImGui::CalcTextSize(widest_label).x + ImGui::GetStyle().FramePadding.x * 2.0f + ImGui::GetFontSize() * 0.75f;
+}
+
+static float list_height(size_t rows, size_t max_rows)
+{
+    return float(std::min(rows, max_rows)) * ImGui::GetFrameHeightWithSpacing() + ImGui::GetTextLineHeightWithSpacing();
+}
+
+static void draw_keys()
+{
+    if (ImGui::TreeNodeEx("Keys", ImGuiTreeNodeFlags_SpanAvailWidth | ImGuiTreeNodeFlags_NoTreePushOnOpen) &&
+        ImGui::BeginTable("keys", 2, ImGuiTableFlags_SizingStretchProp))
+    {
+        for (hotkey &k : g_keys)
+        {
+            ImGui::PushID(k.setting);
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted(k.action);
+            ImGui::TableNextColumn();
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            key_box(k);
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+
+    // ReShade opens its overlay on Home unless told otherwise, which is also
+    // the default for adding a shader, so one press would do both. Shown with
+    // Keys closed too, since that is when nobody would spot it.
+    char value[64] = "";
+    size_t size = sizeof(value);
+    uint32_t overlay[4] = {VK_HOME, 0, 0, 0};
+    if (reshade::get_config_value(nullptr, "INPUT", "KeyOverlay", value, &size))
+        sscanf(value, "%u,%u,%u,%u", &overlay[0], &overlay[1], &overlay[2], &overlay[3]);
+    for (const hotkey &k : g_keys)
+        if (k.key[0] != 0 && std::equal(std::begin(k.key), std::end(k.key), std::begin(overlay)))
+            ImGui::TextColored(ImVec4(0.96f, 0.73f, 0.24f, 1.0f), "%s also opens the ReShade overlay. Pick another "
+                               "key for \"%s\".", hotkey_name(k).c_str(), k.action);
+}
+
 static void draw_finder()
 {
-    ImGui::Separator();
-    ImGui::TextUnformatted("HUD finder");
+    ImGui::SeparatorText("HUD finder");
     bool blink_list = g_blink_list;
-    if (ImGui::Checkbox("Blink the whole list (Delete)", &blink_list))
+    if (ImGui::Checkbox("Blink the whole list", &blink_list))
         g_blink_list = blink_list;
     ImGui::SameLine();
     ImGui::TextDisabled("any part of the HUD that stays steady is missing");
+    draw_keys();
     if (g_scan_frames > 0)
     {
-        ImGui::Text("Scanning, %d frames left", g_scan_frames);
+        ImGui::ProgressBar(1.0f - float(g_scan_frames) / float(SCAN_FRAMES), ImVec2(-FLT_MIN, 0.0f), "Scanning");
         return;
     }
     if (ImGui::Button("Scan"))
@@ -1122,24 +1519,32 @@ static void draw_finder()
         g_scan_counter = 0;
         g_found.clear();
         set_step(-1);
-        g_scan_frames = 60;
+        g_scan_frames = SCAN_FRAMES;
     }
     ImGui::SameLine();
     ImGui::TextDisabled("with the HUD on screen");
     if (g_found.empty())
+    {
+        if (g_scanned)
+            ImGui::TextWrapped("Nothing drew into a target the size of the screen. Scan again with the HUD showing.");
         return;
+    }
 
-    ImGui::TextWrapped("With the overlay closed: Page Down and Page Up make the next or previous shader blink, "
-                       "Home adds the blinking one to the HUD list or takes it off, End stops it. Latest in the "
-                       "frame is at the top, which is where a HUD draws.");
+    ImGui::TextWrapped("With the overlay closed, the keys above make the next or previous shader blink, add the "
+                       "blinking one to the HUD list or take it off, and finish. Latest in the frame is at the top, "
+                       "which is where a HUD draws.");
 
-    if (ImGui::BeginTable("found", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit,
+    static uint32_t copied = 0;
+    static ULONGLONG copied_at = 0;
+    if (ImGui::BeginTable("found", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit,
                           ImVec2(0.0f, 16.0f * ImGui::GetTextLineHeightWithSpacing())))
     {
+        ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("HUD");
         ImGui::TableSetupColumn("Shader");
         ImGui::TableSetupColumn("Draws");
-        ImGui::TableSetupColumn("Target");
+        ImGui::TableSetupColumn("Target", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("##copy", ImGuiTableColumnFlags_WidthFixed, button_column_width("Copied"));
         ImGui::TableHeadersRow();
         for (int i = 0; i < int(g_found.size()); ++i)
         {
@@ -1162,60 +1567,381 @@ static void draw_finder()
             ImGui::TableNextColumn();
             ImGui::Text("%u", c.draws / std::max(c.frames, 1u));
             ImGui::TableNextColumn();
-            ImGui::TextUnformatted(c.on_screen ? "screen" : "texture");
+            ImGui::TextUnformatted(c.on_screen ? "frame" : "texture");
+            ImGui::TableNextColumn();
+            const bool just_copied = copied == c.hash && GetTickCount64() - copied_at < 1500;
+            if (ImGui::SmallButton(just_copied ? "Copied###copy" : "Copy###copy"))
+            {
+                ImGui::SetClipboardText(label);
+                copied = c.hash;
+                copied_at = GetTickCount64();
+            }
             ImGui::PopID();
         }
         ImGui::EndTable();
     }
     if (g_step >= 0)
-        ImGui::Text("Blinking: %u. Click it again or press End to stop.", g_found[g_step].hash);
+    {
+        const std::string stop_key = hotkey_name(g_keys[KEY_STOP]);
+        if (stop_key.empty())
+            ImGui::Text("Blinking: %u. Click it again to finish.", g_found[g_step].hash);
+        else
+            ImGui::Text("Blinking: %u. Click it again or press %s to finish.", g_found[g_step].hash, stop_key.c_str());
+    }
 }
 
+// Read-only box rather than text, so hashes can be selected and copied.
 static void draw_log()
 {
-    ImGui::Separator();
+    ImGui::SeparatorText("Diagnostics");
     if (g_log_state != 0)
         ImGui::TextUnformatted("Logging the next frame...");
     else if (ImGui::Button("Log one frame"))
         g_log_state = 1;
     ImGui::SameLine();
     ImGui::TextDisabled("how the HUD is drawn, and what else draws where it goes; also in ReShade.log");
-    for (const std::string &l : g_log_lines)
-        ImGui::TextWrapped("%s", l.c_str());
-    if (g_suggest.empty())
+    if (g_log_lines.empty())
         return;
 
-    ImGui::TextDisabled("Click one to make it blink. Tick it to add it to the list.");
-    for (size_t i = 0; i < g_suggest.size(); ++i)
+    std::string report;
+    for (const std::string &l : g_log_lines)
+        report += l + '\n';
+    const float height = float(std::min<size_t>(g_log_lines.size(), 12) + 1) * ImGui::GetTextLineHeight() +
+                         ImGui::GetStyle().FramePadding.y * 2.0f;
+    ImGui::InputTextMultiline("##report", report.data(), report.size() + 1, ImVec2(-FLT_MIN, height),
+                              ImGuiInputTextFlags_ReadOnly);
+}
+
+// The state is a word as well as a colour so it reads without telling the
+// colours apart.
+static void draw_status(size_t known_hashes)
+{
+    enum class level { off, problem, waiting, active };
+    level state;
+    std::string detail;
+    if (!g_enabled)
     {
-        const suggestion &sg = g_suggest[i];
-        ImGui::PushID(int(i));
-        bool in_list;
-        {
-            std::shared_lock lock(g_shaders_lock);
-            in_list = g_hud_hashes.count(sg.hash) != 0;
-        }
-        if (ImGui::Checkbox("##add", &in_list))
-            toggle_in_list(sg.hash);
-        ImGui::SameLine();
-        char label[48];
-        snprintf(label, sizeof(label), "%u (%u draws)", sg.hash, sg.draws);
-        if (ImGui::Selectable(label, g_blinking == sg.hash))
-            g_blinking = g_blinking == sg.hash ? 0u : sg.hash;
-        ImGui::PopID();
+        state = level::off;
+        detail = "Effects are not given a mask.";
     }
-    if (ImGui::Button("Add all of them"))
+    else if (known_hashes == 0)
     {
-        for (const suggestion &sg : g_suggest)
+        state = level::problem;
+        if (!g_cfg_found)
+            detail = g_debug ? "No hudmask.cfg beside the add-on yet. Find the HUD's shaders with the finder below, and "
+                               "the file is written as you add them."
+                             : "No hudmask.cfg beside the add-on. Put this game's hudmask.cfg next to "
+                               "hudmask.addon64, or set Debug=1 under [HUDMASK] in ReShade.ini to make one.";
+        else
+            detail = g_debug ? "hudmask.cfg lists no HUD shaders. Add them below, or find them with the finder."
+                             : "hudmask.cfg lists no HUD shaders. Set Debug=1 under [HUDMASK] in ReShade.ini to "
+                               "find them.";
+    }
+    else if (g_fm_failed)
+    {
+        state = level::problem;
+        detail = "The HUD is drawn onto the frame, and building a mask from it is not supported with this "
+                 "graphics API.";
+    }
+    else if (g_share_built <= 0.0f && g_share_texture <= 0.0f)
+    {
+        state = level::waiting;
+        detail = "No listed HUD shader has drawn recently. If the HUD is on screen, the list does not match this "
+                 "game.";
+    }
+    else
+    {
+        state = level::active;
+        char text[192];
+        if (g_share_built > 0.0f)
+            snprintf(text, sizeof(text),
+                     "HUD drawn onto the frame. Mask built from the frame before and after it, seen in %.0f%% of "
+                     "recent frames.", g_share_built * 100.0f);
+        else
+            snprintf(text, sizeof(text), "HUD drawn into its own texture, used as the mask. Seen in %.0f%% of recent "
+                     "frames.", g_share_texture * 100.0f);
+        detail = text;
+    }
+
+    static const ImVec4 accents[] = {
+        ImVec4(0.62f, 0.64f, 0.69f, 1.0f), ImVec4(0.96f, 0.40f, 0.34f, 1.0f),
+        ImVec4(0.96f, 0.73f, 0.24f, 1.0f), ImVec4(0.36f, 0.80f, 0.47f, 1.0f)};
+    static const char *const words[] = {"Off", "Not working", "Waiting for the HUD", "Active"};
+    const ImVec4 &accent = accents[int(state)];
+    const char *word = words[int(state)];
+
+    const float unit = ImGui::GetFontSize();
+    const float pad = unit * 0.65f;
+    const float gap = unit * 0.45f;
+    const float width = ImGui::GetContentRegionAvail().x;
+    const float wrap = std::max(width - pad * 2.0f, unit);
+    const ImVec2 word_size = ImGui::CalcTextSize(word);
+    const ImVec2 text_size = ImGui::CalcTextSize(detail.c_str(), nullptr, false, wrap);
+    const float badge_h = word_size.y + unit * 0.4f;
+    const float height = pad * 2.0f + badge_h + gap + text_size.y;
+
+    ImDrawList *const draw = ImGui::GetWindowDrawList();
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    const ImVec2 corner(origin.x + width, origin.y + height);
+    draw->AddRectFilled(origin, corner, ImGui::ColorConvertFloat4ToU32(ImVec4(accent.x, accent.y, accent.z, 0.15f)),
+                        unit * 0.45f);
+    draw->AddRect(origin, corner, ImGui::ColorConvertFloat4ToU32(ImVec4(accent.x, accent.y, accent.z, 0.55f)),
+                  unit * 0.45f);
+
+    const float dot_radius = unit * 0.17f;
+    const ImVec2 badge_min(origin.x + pad, origin.y + pad);
+    const float word_x = badge_min.x + badge_h * 0.5f + dot_radius + unit * 0.35f;
+    const ImVec2 badge_max(word_x + word_size.x + badge_h * 0.5f, badge_min.y + badge_h);
+    const ImU32 ink = IM_COL32(18, 20, 24, 255);
+    draw->AddRectFilled(badge_min, badge_max, ImGui::ColorConvertFloat4ToU32(accent), badge_h * 0.5f);
+    const ImVec2 dot(badge_min.x + badge_h * 0.5f, badge_min.y + badge_h * 0.5f);
+    if (state == level::off)
+        draw->AddCircle(dot, dot_radius, ink, 0, std::max(unit * 0.08f, 1.0f));
+    else
+        draw->AddCircleFilled(dot, dot_radius, ink);
+    draw->AddText(ImVec2(word_x, badge_min.y + (badge_h - word_size.y) * 0.5f), ink, word);
+
+    ImGui::SetCursorScreenPos(ImVec2(origin.x + pad, badge_min.y + badge_h + gap));
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + wrap);
+    if (state == level::off)
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    ImGui::TextUnformatted(detail.c_str());
+    if (state == level::off)
+        ImGui::PopStyleColor();
+    ImGui::PopTextWrapPos();
+
+    ImGui::SetCursorScreenPos(origin);
+    ImGui::Dummy(ImVec2(width, height));
+}
+
+static void draw_hud_list()
+{
+    std::vector<uint32_t> listed;
+    std::unordered_set<uint32_t> created;
+    {
+        std::shared_lock lock(g_shaders_lock);
+        listed.assign(g_hud_hashes.begin(), g_hud_hashes.end());
+        // Distinct hashes: some games create the same shader twice.
+        for (const auto &[handle, hash] : g_shaders)
+            if (g_hud_hashes.count(hash) != 0)
+                created.insert(hash);
+    }
+    std::sort(listed.begin(), listed.end());
+
+    ImGui::SeparatorText("HUD shaders");
+    if (listed.empty())
+        ImGui::TextDisabled("None listed yet.");
+    else
+        ImGui::Text("%zu listed, %zu created by the game", listed.size(), created.size());
+    if (g_last_desc.texture.width != 0)
+    {
+        const char *name = format_name(g_last_desc.texture.format);
+        if (strcmp(name, "other") != 0)
+            ImGui::TextDisabled("HUD texture: %u x %u, %s", g_last_desc.texture.width, g_last_desc.texture.height, name);
+        else
+            ImGui::TextDisabled("HUD texture: %u x %u, format %u", g_last_desc.texture.width,
+                                g_last_desc.texture.height, static_cast<uint32_t>(g_last_desc.texture.format));
+    }
+
+    if (!listed.empty() &&
+        ImGui::BeginTable("hudlist", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit,
+                          ImVec2(0.0f, list_height(listed.size(), 8))))
+    {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Shader");
+        ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("##remove", ImGuiTableColumnFlags_WidthFixed, button_column_width("Remove"));
+        ImGui::TableHeadersRow();
+        for (uint32_t hash : listed)
         {
-            std::unique_lock lock(g_shaders_lock);
-            g_hud_hashes.insert(sg.hash);
+            ImGui::PushID(int(hash));
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::AlignTextToFramePadding();
+            ImGui::Text("%u", hash);
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("%s", created.count(hash) != 0 ? "created" : "not created yet");
+            ImGui::TableNextColumn();
+            if (ImGui::SmallButton("Remove"))
+                toggle_in_list(hash);
+            ImGui::PopID();
         }
-        save_hud_list();
+        ImGui::EndTable();
+    }
+
+    static char entry[512] = "";
+    static bool no_hash = false;
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize("Add").x -
+                            ImGui::GetStyle().FramePadding.x * 2.0f - ImGui::GetStyle().ItemSpacing.x);
+    bool add = ImGui::InputTextWithHint("##add", "Add hashes, comma separated", entry, sizeof(entry),
+                                        ImGuiInputTextFlags_EnterReturnsTrue);
+    if (ImGui::IsItemEdited())
+        no_hash = false;
+    ImGui::SameLine();
+    ImGui::BeginDisabled(entry[0] == '\0');
+    add |= ImGui::Button("Add");
+    ImGui::EndDisabled();
+    if (add && entry[0] != '\0')
+    {
+        std::unordered_set<uint32_t> hashes;
+        parse_hashes(entry, hashes);
+        no_hash = hashes.empty();
+        if (!no_hash)
+        {
+            {
+                std::unique_lock lock(g_shaders_lock);
+                g_hud_hashes.insert(hashes.begin(), hashes.end());
+            }
+            save_hud_list();
+            entry[0] = '\0';
+        }
+    }
+    if (no_hash)
+        ImGui::TextWrapped("No hash in that. A hash is a whole number from 1 to 4294967295.");
+}
+
+// Shaders learned this session wait here for a look. They are already in the
+// list and saved: Keep only clears them from here, Remove takes them off.
+static void draw_learned()
+{
+    std::vector<uint32_t> learned;
+    {
+        std::shared_lock lock(g_shaders_lock);
+        learned = g_learned;
+    }
+    if (learned.empty())
+        return;
+
+    ImGui::Text("Learned this session: %zu", learned.size());
+    ImGui::SameLine();
+    ImGui::TextDisabled("click one to make it blink");
+    uint32_t keep = 0, remove = 0;
+    if (ImGui::BeginTable("learned", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit,
+                          ImVec2(0.0f, list_height(learned.size(), 6))))
+    {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Shader", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("##keep");
+        ImGui::TableSetupColumn("##remove", ImGuiTableColumnFlags_WidthFixed, button_column_width("Remove"));
+        ImGui::TableHeadersRow();
+        for (uint32_t hash : learned)
+        {
+            ImGui::PushID(int(hash));
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            char label[16];
+            snprintf(label, sizeof(label), "%u", hash);
+            if (ImGui::Selectable(label, g_blinking == hash, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap))
+                g_blinking = g_blinking == hash ? 0u : hash;
+            ImGui::TableNextColumn();
+            if (ImGui::SmallButton("Keep"))
+                keep = hash;
+            ImGui::TableNextColumn();
+            if (ImGui::SmallButton("Remove"))
+                remove = hash;
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    if (ImGui::Button("Keep all"))
+    {
+        std::unique_lock lock(g_shaders_lock);
+        g_learned.clear();
+    }
+
+    if (keep != 0 || remove != 0)
+    {
+        const uint32_t done = keep != 0 ? keep : remove;
+        if (g_blinking == done)
+            g_blinking = 0;
+        if (remove != 0)
+            toggle_in_list(remove);
+        std::unique_lock lock(g_shaders_lock);
+        g_learned.erase(std::remove(g_learned.begin(), g_learned.end(), done), g_learned.end());
     }
 }
 
-static void draw_settings(effect_runtime *)
+// What learning is doing right now. It finds the HUD texture through the
+// shaders already listed, so with none listed, or before the texture has been
+// trusted, it has nothing to watch yet, and the panel says which.
+static void draw_learning()
+{
+    ImGui::SeparatorText("Learning");
+    bool learn = g_learn;
+    if (ImGui::Checkbox("Learn new HUD shaders while playing", &learn))
+    {
+        g_learn = learn;
+        reshade::set_config_value(nullptr, SECTION, "LearnHud", learn);
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("In a game that draws its HUD into a texture of its own, any shader that draws into\n"
+                          "that texture is HUD too, so it is added to hudmask.cfg as it appears: menus, maps,\n"
+                          "dialogue, popups.");
+    if (g_learn)
+    {
+        bool trusted = false;
+        uint32_t checking = 0;
+        {
+            std::lock_guard lock(g_learn_lock);
+            for (uint64_t h : g_hud_textures)
+                trusted |= h != 0;
+            if (g_hud_candidate != 0)
+                checking = g_hud_candidate_frames;
+        }
+        size_t listed;
+        {
+            std::shared_lock lock(g_shaders_lock);
+            listed = g_hud_hashes.size();
+        }
+        if (!g_enabled)
+            ImGui::TextWrapped("Paused while the mask is off.");
+        else if (trusted)
+            ImGui::TextWrapped("Watching the HUD texture. Shaders that start drawing into it show up below as they "
+                               "are learned. Open menus, the map and dialogue to bring them out.");
+        else if (g_share_built > 0.0f)
+            ImGui::TextWrapped("This game draws its HUD onto the frame, where a shader drawing after the HUD can "
+                               "be scene as well, so nothing is learned. Use the finder.");
+        else if (listed == 0)
+            ImGui::TextWrapped("Learning finds the HUD texture through a shader already listed. Scan with the finder "
+                               "and add one HUD shader; the rest are learned from there.");
+        else if (checking > 0)
+            ImGui::TextWrapped("Checking the HUD texture before trusting it: %u%%. Keep the HUD on screen.",
+                               std::min(checking * 100 / TRUST_FRAMES, 99u));
+        else if (g_share_texture > 0.0f)
+            ImGui::TextWrapped("The HUD texture is not 8 bits per channel with alpha, so it may hold the scene, and "
+                               "nothing is learned from it.");
+        else
+            ImGui::TextWrapped("Waiting for a listed shader to draw the HUD. Bring the HUD on screen.");
+    }
+    draw_learned();
+}
+
+static void draw_preview(effect_runtime *runtime)
+{
+    if (!ImGui::TreeNodeEx("Mask preview", ImGuiTreeNodeFlags_SpanAvailWidth | ImGuiTreeNodeFlags_NoTreePushOnOpen))
+        return;
+    const resource_view view = render_preview(runtime);
+    if (view.handle == 0)
+    {
+        if (g_preview_failed)
+            ImGui::TextDisabled("The preview is not available with this graphics API.");
+        else if (!g_enabled)
+            ImGui::TextDisabled("The mask is off.");
+        else
+            ImGui::TextDisabled("No mask this frame.");
+    }
+    else
+    {
+        const float width = std::min(ImGui::GetContentRegionAvail().x, float(g_preview.width));
+        const ImVec2 size(width, width * float(g_preview.height) / float(g_preview.width));
+        ImGui::Image(ImTextureID(view.handle), size, ImVec2(0.0f, 0.0f), ImVec2(1.0f, 1.0f));
+        ImGui::GetWindowDrawList()->AddRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
+                                            ImGui::GetColorU32(ImGuiCol_Border));
+        ImGui::TextDisabled("White is HUD, black is scene.");
+    }
+}
+
+static void draw_settings(effect_runtime *runtime)
 {
     bool enabled = g_enabled;
     if (ImGui::Checkbox("Give effects the HUD mask", &enabled))
@@ -1228,74 +1954,15 @@ static void draw_settings(effect_runtime *)
         std::shared_lock lock(g_shaders_lock);
         known = g_hud_hashes.size();
     }
-    if (known == 0)
-        ImGui::TextWrapped("No hudmask.cfg with this game's HUD shaders beside the add-on. Set Debug=1 under "
-                           "[HUDMASK] in ReShade.ini to find them.");
-    else if (g_fm_failed)
-        ImGui::TextWrapped("The HUD is drawn onto the frame, and building a mask from it is not supported with "
-                           "this graphics API.");
-    else if (g_share_built > 0.0f)
-        ImGui::TextWrapped("HUD drawn onto the frame: mask built from the frame before and after it, in %.0f%% of "
-                           "recent frames.", g_share_built * 100.0f);
-    else
-        ImGui::TextWrapped("HUD drawn into its own texture: its alpha is the mask, in %.0f%% of recent frames.",
-                           g_share_texture * 100.0f);
+    draw_status(known);
+    draw_preview(runtime);
     if (!g_debug)
         return;
 
-    ImGui::Separator();
-    // Count distinct hashes. Some games create the same shader twice.
-    size_t created = 0;
-    {
-        std::shared_lock lock(g_shaders_lock);
-        std::unordered_set<uint32_t> present;
-        for (const auto &[handle, hash] : g_shaders)
-            if (g_hud_hashes.count(hash) != 0)
-                present.insert(hash);
-        created = present.size();
-    }
-    ImGui::Text("HUD shaders the game has created: %zu of %zu", created, known);
-    if (g_last_desc.texture.width != 0)
-        ImGui::Text("HUD texture: %u x %u, format %u", g_last_desc.texture.width, g_last_desc.texture.height,
-                    static_cast<uint32_t>(g_last_desc.texture.format));
-
-    char buf[4096];
-    strncpy(buf, g_hud_list.c_str(), sizeof(buf) - 1);
-    buf[sizeof(buf) - 1] = '\0';
-    ImGui::SetNextItemWidth(-1.0f);
-    if (ImGui::InputText("##hud", buf, sizeof(buf), ImGuiInputTextFlags_EnterReturnsTrue))
-    {
-        g_hud_list = buf;
-        {
-            std::unique_lock lock(g_shaders_lock);
-            parse_hud_list();
-        }
-        save_hud_list();
-    }
-    ImGui::TextDisabled("HUD pixel shader hashes, comma separated, saved to hudmask.cfg. Press Enter to apply.");
-
-    bool learn = g_learn;
-    if (ImGui::Checkbox("Learn new HUD shaders while playing", &learn))
-    {
-        g_learn = learn;
-        reshade::set_config_value(nullptr, SECTION, "LearnHud", learn);
-    }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("In a game that draws its HUD into a texture of its own, any shader that draws into\n"
-                          "that texture is added to hudmask.cfg as it appears: menus, maps, dialogue, popups.");
-    {
-        std::shared_lock lock(g_shaders_lock);
-        if (!g_learned.empty())
-        {
-            std::string list;
-            for (uint32_t h : g_learned)
-                list += (list.empty() ? "" : ", ") + std::to_string(h);
-            ImGui::TextWrapped("Learned this session: %s", list.c_str());
-        }
-    }
-
-    draw_log();
+    draw_hud_list();
     draw_finder();
+    draw_learning();
+    draw_log();
 }
 
 //----------------------------------------------------------------------------
@@ -1318,6 +1985,7 @@ static bool register_with_reshade()
     reshade::register_event<reshade::addon_event::draw_or_dispatch_indirect>(on_draw_indirect);
     reshade::register_event<reshade::addon_event::reshade_begin_effects>(on_begin_effects);
     reshade::register_event<reshade::addon_event::present>(on_present);
+    reshade::register_event<reshade::addon_event::reshade_open_overlay>(on_open_overlay);
     reshade::register_overlay(nullptr, draw_settings);
     return true;
 }
